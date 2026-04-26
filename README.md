@@ -1,6 +1,8 @@
 # RAC Propagation Simulator
 
-Interactive simulator of Recursive Autonomous Compromise (RAC) dynamics on capability-gated networks. SI propagation over a fixed Erdős–Rényi topology with adjustable inference density (ρ) and transmission probability (p).
+Interactive simulator of Recursive Autonomous Compromise (RAC) dynamics on capability-gated networks. SI propagation over a generated Erdős–Rényi or scale-free topology with adjustable inference density (ρ) and transmission probability (p). Crowd defense prevalence (v) can also be adjusted.
+
+Parameters can be swept to generate scatter plots against the compromise rate.
 
 ## Local development
 
