@@ -441,12 +441,20 @@ function buildInitialState(capability, subscribed, infPrio, initialCount) {
 //   • a compromised host (non-capable I, a machine the swarm already owns) is
 //     reclaimed with probability η (`hostReclamation`). Reclaimed hosts are immune
 //     but, lacking inference, do not propagate further.
-// Ancestral reach (`ancestralReach`, default on): each node records the agent that
-// compromised it (`parent`). A defender agent inherits that lineage, so its whole
-// chain of compromising ancestors (parent, grandparent, … back to the seed) counts
-// as neighbors for σ-conversion, even where the network has no direct edge. The
-// chain is walked through ancestors already converted, since each one knows its own
-// compromiser. Ancestors that are also direct neighbors are tried only once.
+// Lineage reach (`lineageReach`) widens who a defender agent can hit with σ beyond
+// its direct network neighbors:
+//   • 'off'    — direct neighbors only.
+//   • 'direct' — (default) each node records the agent that compromised it
+//     (`parent`). A defender inherits that lineage, so its whole chain of
+//     compromising ancestors (parent, grandparent, … back to the seed) counts as
+//     neighbors, even without a direct edge. The chain is walked through ancestors
+//     already converted, since each one knows its own compromiser. Ancestors that
+//     are also direct neighbors are tried only once.
+//   • 'full'   — the swarm runs on a global C2, so a commandeered agent can reach
+//     every compromised agent in the swarm (every infection tree, across all seeds).
+//     Each defender agent attempts each swarm agent once per tick; with k defender
+//     agents, a swarm agent converts with probability 1 − (1 − σ)^k, drawn once.
+// Hosts are never reached through lineage or C2: reclamation always needs an edge.
 // D is absorbing and blocks reinfection. Reversal draws come from a separate PRNG
 // stream, so with κ = σ = η = 0 the transmission sequence is bit-identical to the
 // plain SI+V model.
@@ -460,7 +468,7 @@ function stepDynamics(state, params, seed) {
     commandeer = 0,
     swarmConversion = 0,
     hostReclamation = 0,
-    ancestralReach = false,
+    lineageReach = 'off',
   } = params;
   const infState = state.infected;
   const defState = state.defender ?? new Array(N).fill(false);
@@ -505,18 +513,35 @@ function stepDynamics(state, params, seed) {
       if (!defState[i] || !capability[i]) continue;
       for (const j of adjacency[i]) {
         if (!infState[j] || nextDef[j]) continue;
+        // Under a global C2, swarm agents are handled in aggregate below.
+        if (capability[j] && lineageReach === 'full') continue;
         const q = capability[j] ? swarmConversion : hostReclamation;
         if (q > 0 && reversalRng() < q) {
           nextInf[j] = false;
           nextDef[j] = true;
         }
       }
-      if (ancestralReach && swarmConversion > 0) {
+      if (lineageReach === 'direct' && swarmConversion > 0) {
         for (let a = parent[i]; a !== -1; a = parent[a]) {
           if (!infState[a] || nextDef[a] || adjacency[i].includes(a)) continue;
           if (reversalRng() < swarmConversion) {
             nextInf[a] = false;
             nextDef[a] = true;
+          }
+        }
+      }
+    }
+
+    if (lineageReach === 'full' && swarmConversion > 0) {
+      let k = 0;
+      for (let i = 0; i < N; i++) if (defState[i] && capability[i]) k++;
+      if (k > 0) {
+        const q = 1 - (1 - swarmConversion) ** k;
+        for (let j = 0; j < N; j++) {
+          if (!infState[j] || !capability[j] || nextDef[j]) continue;
+          if (reversalRng() < q) {
+            nextInf[j] = false;
+            nextDef[j] = true;
           }
         }
       }
@@ -528,10 +553,10 @@ function stepDynamics(state, params, seed) {
 
 // Filename tag for reversal parameters; empty when reversal is off so figures
 // exported from the plain SI+V model keep their original names.
-function reversalTag({ commandeer, swarmConversion, hostReclamation, ancestralReach }) {
+function reversalTag({ commandeer, swarmConversion, hostReclamation, lineageReach }) {
   if (!commandeer && !swarmConversion && !hostReclamation) return '';
   const f = (x) => x.toFixed(2).replace('.', '');
-  const anc = ancestralReach ? '_anc' : '';
+  const anc = { direct: '_anc', full: '_c2' }[lineageReach] ?? '';
   return `_rev_k${f(commandeer)}_s${f(swarmConversion)}_h${f(hostReclamation)}${anc}`;
 }
 
@@ -585,7 +610,7 @@ export default function RACSimulator() {
   const [commandeer, setCommandeer] = useState(0);             // κ — target seizes its attacker
   const [swarmConversion, setSwarmConversion] = useState(0);   // σ — defender converts swarm agent
   const [hostReclamation, setHostReclamation] = useState(0);   // η — defender reclaims compromised host
-  const [ancestralReach, setAncestralReach] = useState(true);  // σ also reaches compromising ancestors
+  const [lineageReach, setLineageReach] = useState('direct');  // σ reach: 'off' | 'direct' | 'full'
 
   // Playback
   const [simSeed, setSimSeed] = useState(1);
@@ -726,8 +751,8 @@ export default function RACSimulator() {
   }, [capability, subscribed, infPrio, initialInfected, simSeed]);
 
   const reversal = useMemo(
-    () => ({ commandeer, swarmConversion, hostReclamation, ancestralReach }),
-    [commandeer, swarmConversion, hostReclamation, ancestralReach]
+    () => ({ commandeer, swarmConversion, hostReclamation, lineageReach }),
+    [commandeer, swarmConversion, hostReclamation, lineageReach]
   );
 
   // Shared dynamics parameters for every simulation path.
@@ -1125,7 +1150,7 @@ export default function RACSimulator() {
       c.commandeer !== commandeer ||
       c.swarmConversion !== swarmConversion ||
       c.hostReclamation !== hostReclamation ||
-      c.ancestralReach !== ancestralReach ||
+      c.lineageReach !== lineageReach ||
       c.subscriptionMode !== subscriptionMode
     );
   }, [
@@ -1157,7 +1182,7 @@ export default function RACSimulator() {
       c.commandeer !== commandeer ||
       c.swarmConversion !== swarmConversion ||
       c.hostReclamation !== hostReclamation ||
-      c.ancestralReach !== ancestralReach ||
+      c.lineageReach !== lineageReach ||
       c.subscriptionMode !== subscriptionMode
     ) {
       return true;
@@ -1519,20 +1544,21 @@ export default function RACSimulator() {
               </div>
               <div className="space-y-1.5">
                 <label className="text-xs uppercase tracking-wider text-stone-500 font-medium">
-                  Ancestral reach
+                  Lineage reach
                 </label>
-                <div className="grid grid-cols-2 border border-stone-900">
+                <div className="grid grid-cols-3 border border-stone-900">
                   {[
-                    { key: true, label: 'On' },
-                    { key: false, label: 'Off' },
+                    { key: 'off', label: 'Off' },
+                    { key: 'direct', label: 'Direct' },
+                    { key: 'full', label: 'Full (C2)' },
                   ].map((m, i) => (
                     <button
-                      key={m.label}
-                      onClick={() => setAncestralReach(m.key)}
+                      key={m.key}
+                      onClick={() => setLineageReach(m.key)}
                       className={`px-2 py-1.5 text-[11px] uppercase tracking-wider transition-colors ${
                         i > 0 ? 'border-l border-stone-900' : ''
                       } ${
-                        ancestralReach === m.key
+                        lineageReach === m.key
                           ? 'bg-stone-900 text-white'
                           : 'bg-white hover:bg-stone-100'
                       }`}
@@ -1542,9 +1568,11 @@ export default function RACSimulator() {
                   ))}
                 </div>
                 <div className="text-[10px] text-stone-500 leading-snug">
-                  {ancestralReach
+                  {lineageReach === 'off'
+                    ? 'Defenders reach only their direct network neighbors.'
+                    : lineageReach === 'direct'
                     ? 'A defender also targets its chain of compromising agents (parent, grandparent, … back to the seed) with σ, even without a direct edge.'
-                    : 'Defenders reach only their direct network neighbors.'}
+                    : 'Global C2: the swarm is unified, so every defender agent reaches every compromised agent with σ each tick, across the entire infection tree.'}
                 </div>
               </div>
               <div className="space-y-1.5">
@@ -1754,10 +1782,12 @@ export default function RACSimulator() {
               every compromised neighbor, converting swarm agents (compromised inference-capable
               nodes) into further defender agents with probability σ and reclaiming compromised
               hosts (non-inference nodes the swarm already holds) with probability η. Converted
-              agents propagate the reversal onward; reclaimed hosts cannot. With ancestral reach on,
-              a defender also knows the lineage of agents that compromised it and applies σ to
-              each of those ancestors back to the seed, whether or not they share an edge with
-              it. D is absorbing and
+              agents propagate the reversal onward; reclaimed hosts cannot. Lineage reach widens σ
+              beyond direct links: in Direct mode a defender also knows the lineage of agents that
+              compromised it and applies σ to each ancestor back to the seed; in Full (C2) mode the
+              swarm shares a global command-and-control channel, so every defender agent applies σ
+              to every compromised agent in the swarm each tick. Host reclamation always needs a
+              direct link. D is absorbing and
               blocks reinfection, so the attack and the reversal front compete on the same
               substrate. With κ = σ = η = 0 the model reduces exactly to SI + reactive-V.
             </div>
@@ -1796,7 +1826,9 @@ export default function RACSimulator() {
                   κ = {(sweepCapture?.commandeer ?? commandeer).toFixed(2)} · σ ={' '}
                   {(sweepCapture?.swarmConversion ?? swarmConversion).toFixed(2)} · η ={' '}
                   {(sweepCapture?.hostReclamation ?? hostReclamation).toFixed(2)}
-                  {(sweepCapture?.ancestralReach ?? ancestralReach) ? ' · ancestral' : ''}
+                  {{ direct: ' · ancestral', full: ' · global C2' }[
+                    sweepCapture?.lineageReach ?? lineageReach
+                  ] ?? ''}
                 </div>
               )}
             </div>
