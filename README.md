@@ -2,6 +2,8 @@
 
 Interactive simulator of Recursive Autonomous Compromise (RAC) dynamics on capability-gated networks. SI propagation over a generated Erdős–Rényi or scale-free topology with adjustable inference density (ρ) and transmission probability (p). Crowd defense prevalence (v) can also be adjusted.
 
+Optional reversal dynamics add a defender state (D). A probed target can commandeer the attacking agent with probability κ per attack attempt and repurpose it as a defender. Defender agents then spread the reversal back through the swarm's own reach: each tick they convert neighboring swarm agents (compromised inference-capable nodes) into further defenders with probability σ, and reclaim neighboring hosts the swarm already compromised (non-inference nodes) with probability η. With κ = σ = η = 0 (the default) the model reduces exactly to SI + reactive-V.
+
 Parameters can be swept to generate scatter plots against the compromise rate.
 
 ## Local development
