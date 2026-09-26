@@ -420,7 +420,12 @@ function buildInitialState(capability, subscribed, infPrio, initialCount) {
       if (subscribed[i] && !infected[i]) vaccinated[i] = true;
     }
   }
-  return { infected, vaccinated, defender: new Array(N).fill(false) };
+  return {
+    infected,
+    vaccinated,
+    defender: new Array(N).fill(false),
+    parent: new Array(N).fill(-1),
+  };
 }
 
 // One synchronous tick of SI + reactive-V + reversal (D) dynamics. Pure; every
@@ -436,6 +441,12 @@ function buildInitialState(capability, subscribed, infPrio, initialCount) {
 //   • a compromised host (non-capable I, a machine the swarm already owns) is
 //     reclaimed with probability η (`hostReclamation`). Reclaimed hosts are immune
 //     but, lacking inference, do not propagate further.
+// Ancestral reach (`ancestralReach`, default on): each node records the agent that
+// compromised it (`parent`). A defender agent inherits that lineage, so its whole
+// chain of compromising ancestors (parent, grandparent, … back to the seed) counts
+// as neighbors for σ-conversion, even where the network has no direct edge. The
+// chain is walked through ancestors already converted, since each one knows its own
+// compromiser. Ancestors that are also direct neighbors are tried only once.
 // D is absorbing and blocks reinfection. Reversal draws come from a separate PRNG
 // stream, so with κ = σ = η = 0 the transmission sequence is bit-identical to the
 // plain SI+V model.
@@ -449,14 +460,17 @@ function stepDynamics(state, params, seed) {
     commandeer = 0,
     swarmConversion = 0,
     hostReclamation = 0,
+    ancestralReach = false,
   } = params;
   const infState = state.infected;
   const defState = state.defender ?? new Array(N).fill(false);
+  const parent = state.parent ?? new Array(N).fill(-1);
   const rng = mulberry32(seed);
   const reversalRng = mulberry32(seed ^ 0x9e3779b9);
   const nextInf = [...infState];
   const nextVac = [...state.vaccinated];
   const nextDef = [...defState];
+  const nextParent = [...parent];
 
   // Reactive vaccination — if any node is compromised, all unprotected
   // subscribers transition S → V instantly. Idempotent (safe to apply every tick).
@@ -477,7 +491,11 @@ function stepDynamics(state, params, seed) {
         nextDef[i] = true;
         break;
       }
-      if (!nextVac[j] && rng() < transmission) nextInf[j] = true;
+      if (!nextVac[j] && rng() < transmission) {
+        // First successful attacker this tick is recorded as the compromiser.
+        if (!nextInf[j]) nextParent[j] = i;
+        nextInf[j] = true;
+      }
     }
   }
 
@@ -493,18 +511,28 @@ function stepDynamics(state, params, seed) {
           nextDef[j] = true;
         }
       }
+      if (ancestralReach && swarmConversion > 0) {
+        for (let a = parent[i]; a !== -1; a = parent[a]) {
+          if (!infState[a] || nextDef[a] || adjacency[i].includes(a)) continue;
+          if (reversalRng() < swarmConversion) {
+            nextInf[a] = false;
+            nextDef[a] = true;
+          }
+        }
+      }
     }
   }
 
-  return { infected: nextInf, vaccinated: nextVac, defender: nextDef };
+  return { infected: nextInf, vaccinated: nextVac, defender: nextDef, parent: nextParent };
 }
 
 // Filename tag for reversal parameters; empty when reversal is off so figures
 // exported from the plain SI+V model keep their original names.
-function reversalTag({ commandeer, swarmConversion, hostReclamation }) {
+function reversalTag({ commandeer, swarmConversion, hostReclamation, ancestralReach }) {
   if (!commandeer && !swarmConversion && !hostReclamation) return '';
   const f = (x) => x.toFixed(2).replace('.', '');
-  return `_rev_k${f(commandeer)}_s${f(swarmConversion)}_h${f(hostReclamation)}`;
+  const anc = ancestralReach ? '_anc' : '';
+  return `_rev_k${f(commandeer)}_s${f(swarmConversion)}_h${f(hostReclamation)}${anc}`;
 }
 
 function Slider({ label, value, min, max, step, onChange, format }) {
@@ -557,6 +585,7 @@ export default function RACSimulator() {
   const [commandeer, setCommandeer] = useState(0);             // κ — target seizes its attacker
   const [swarmConversion, setSwarmConversion] = useState(0);   // σ — defender converts swarm agent
   const [hostReclamation, setHostReclamation] = useState(0);   // η — defender reclaims compromised host
+  const [ancestralReach, setAncestralReach] = useState(true);  // σ also reaches compromising ancestors
 
   // Playback
   const [simSeed, setSimSeed] = useState(1);
@@ -565,6 +594,7 @@ export default function RACSimulator() {
   const [infected, setInfected] = useState([]);
   const [vaccinated, setVaccinated] = useState([]);
   const [defender, setDefender] = useState([]);
+  const [parent, setParent] = useState([]);
   const [playing, setPlaying] = useState(false);
 
   // Sweep
@@ -685,6 +715,7 @@ export default function RACSimulator() {
     setInfected(st.infected);
     setVaccinated(st.vaccinated);
     setDefender(st.defender);
+    setParent(st.parent);
   };
 
   // Reset whenever any initial-condition parameter changes.
@@ -695,8 +726,8 @@ export default function RACSimulator() {
   }, [capability, subscribed, infPrio, initialInfected, simSeed]);
 
   const reversal = useMemo(
-    () => ({ commandeer, swarmConversion, hostReclamation }),
-    [commandeer, swarmConversion, hostReclamation]
+    () => ({ commandeer, swarmConversion, hostReclamation, ancestralReach }),
+    [commandeer, swarmConversion, hostReclamation, ancestralReach]
   );
 
   // Shared dynamics parameters for every simulation path.
@@ -712,9 +743,9 @@ export default function RACSimulator() {
   );
 
   const step = useCallback(() => {
-    applyState(stepOnce({ infected, vaccinated, defender }, tick));
+    applyState(stepOnce({ infected, vaccinated, defender, parent }, tick));
     setTick((t) => t + 1);
-  }, [stepOnce, infected, vaccinated, defender, tick]);
+  }, [stepOnce, infected, vaccinated, defender, parent, tick]);
 
   // Playback loop.
   useEffect(() => {
@@ -728,11 +759,11 @@ export default function RACSimulator() {
 
   // Refs so the playback interval always reads latest state.
   const tickRef = useRef(tick);
-  const stateRef = useRef({ infected, vaccinated, defender });
+  const stateRef = useRef({ infected, vaccinated, defender, parent });
   useEffect(() => { tickRef.current = tick; }, [tick]);
   useEffect(() => {
-    stateRef.current = { infected, vaccinated, defender };
-  }, [infected, vaccinated, defender]);
+    stateRef.current = { infected, vaccinated, defender, parent };
+  }, [infected, vaccinated, defender, parent]);
 
   // Synchronous run-to-tick — for generating the exact figure.
   const runToTarget = useCallback(() => {
@@ -1094,6 +1125,7 @@ export default function RACSimulator() {
       c.commandeer !== commandeer ||
       c.swarmConversion !== swarmConversion ||
       c.hostReclamation !== hostReclamation ||
+      c.ancestralReach !== ancestralReach ||
       c.subscriptionMode !== subscriptionMode
     );
   }, [
@@ -1125,6 +1157,7 @@ export default function RACSimulator() {
       c.commandeer !== commandeer ||
       c.swarmConversion !== swarmConversion ||
       c.hostReclamation !== hostReclamation ||
+      c.ancestralReach !== ancestralReach ||
       c.subscriptionMode !== subscriptionMode
     ) {
       return true;
@@ -1485,6 +1518,36 @@ export default function RACSimulator() {
                 </div>
               </div>
               <div className="space-y-1.5">
+                <label className="text-xs uppercase tracking-wider text-stone-500 font-medium">
+                  Ancestral reach
+                </label>
+                <div className="grid grid-cols-2 border border-stone-900">
+                  {[
+                    { key: true, label: 'On' },
+                    { key: false, label: 'Off' },
+                  ].map((m, i) => (
+                    <button
+                      key={m.label}
+                      onClick={() => setAncestralReach(m.key)}
+                      className={`px-2 py-1.5 text-[11px] uppercase tracking-wider transition-colors ${
+                        i > 0 ? 'border-l border-stone-900' : ''
+                      } ${
+                        ancestralReach === m.key
+                          ? 'bg-stone-900 text-white'
+                          : 'bg-white hover:bg-stone-100'
+                      }`}
+                    >
+                      {m.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="text-[10px] text-stone-500 leading-snug">
+                  {ancestralReach
+                    ? 'A defender also targets its chain of compromising agents (parent, grandparent, … back to the seed) with σ, even without a direct edge.'
+                    : 'Defenders reach only their direct network neighbors.'}
+                </div>
+              </div>
+              <div className="space-y-1.5">
                 <Slider
                   label="Host reclamation  η"
                   value={hostReclamation}
@@ -1691,7 +1754,10 @@ export default function RACSimulator() {
               every compromised neighbor, converting swarm agents (compromised inference-capable
               nodes) into further defender agents with probability σ and reclaiming compromised
               hosts (non-inference nodes the swarm already holds) with probability η. Converted
-              agents propagate the reversal onward; reclaimed hosts cannot. D is absorbing and
+              agents propagate the reversal onward; reclaimed hosts cannot. With ancestral reach on,
+              a defender also knows the lineage of agents that compromised it and applies σ to
+              each of those ancestors back to the seed, whether or not they share an edge with
+              it. D is absorbing and
               blocks reinfection, so the attack and the reversal front compete on the same
               substrate. With κ = σ = η = 0 the model reduces exactly to SI + reactive-V.
             </div>
@@ -1730,6 +1796,7 @@ export default function RACSimulator() {
                   κ = {(sweepCapture?.commandeer ?? commandeer).toFixed(2)} · σ ={' '}
                   {(sweepCapture?.swarmConversion ?? swarmConversion).toFixed(2)} · η ={' '}
                   {(sweepCapture?.hostReclamation ?? hostReclamation).toFixed(2)}
+                  {(sweepCapture?.ancestralReach ?? ancestralReach) ? ' · ancestral' : ''}
                 </div>
               )}
             </div>
