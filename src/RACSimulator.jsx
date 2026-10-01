@@ -420,7 +420,144 @@ function buildInitialState(capability, subscribed, infPrio, initialCount) {
       if (subscribed[i] && !infected[i]) vaccinated[i] = true;
     }
   }
-  return { infected, vaccinated };
+  return {
+    infected,
+    vaccinated,
+    defender: new Array(N).fill(false),
+    parent: new Array(N).fill(-1),
+  };
+}
+
+// One synchronous tick of SI + reactive-V + reversal (D) dynamics. Pure; every
+// simulation path (step, run-to-tick, sweep, surface) goes through here.
+//
+// Reversal dynamics. Each attack attempt by a compromised inference-capable agent on
+// a clean neighbor (S or V) is first resolved against κ (`commandeer`): with probability
+// κ the target seizes control of the attacker, which flips I → D (defender) and stops
+// attacking. Defender agents (capable D nodes) then turn the swarm's own reach against
+// it: each tick, every defender agent attempts each compromised neighbor —
+//   • a compromised agent (capable I, i.e. a swarm member) converts to a defender
+//     agent with probability σ (`swarmConversion`), and in turn propagates reversal;
+//   • a compromised host (non-capable I, a machine the swarm already owns) is
+//     reclaimed with probability η (`hostReclamation`). Reclaimed hosts are immune
+//     but, lacking inference, do not propagate further.
+// Lineage reach (`lineageReach`) widens who a defender agent can hit with σ beyond
+// its direct network neighbors:
+//   • 'off'    — direct neighbors only.
+//   • 'direct' — (default) each node records the agent that compromised it
+//     (`parent`). A defender inherits that lineage, so its whole chain of
+//     compromising ancestors (parent, grandparent, … back to the seed) counts as
+//     neighbors, even without a direct edge. The chain is walked through ancestors
+//     already converted, since each one knows its own compromiser. Ancestors that
+//     are also direct neighbors are tried only once.
+//   • 'full'   — the swarm runs on a global C2, so a commandeered agent can reach
+//     every compromised agent in the swarm (every infection tree, across all seeds).
+//     Each defender agent attempts each swarm agent once per tick; with k defender
+//     agents, a swarm agent converts with probability 1 − (1 − σ)^k, drawn once.
+// Hosts are never reached through lineage or C2: reclamation always needs an edge.
+// D is absorbing and blocks reinfection. Reversal draws come from a separate PRNG
+// stream, so with κ = σ = η = 0 the transmission sequence is bit-identical to the
+// plain SI+V model.
+function stepDynamics(state, params, seed) {
+  const {
+    N,
+    adjacency,
+    capability,
+    subscribed,
+    transmission,
+    commandeer = 0,
+    swarmConversion = 0,
+    hostReclamation = 0,
+    lineageReach = 'off',
+  } = params;
+  const infState = state.infected;
+  const defState = state.defender ?? new Array(N).fill(false);
+  const parent = state.parent ?? new Array(N).fill(-1);
+  const rng = mulberry32(seed);
+  const reversalRng = mulberry32(seed ^ 0x9e3779b9);
+  const nextInf = [...infState];
+  const nextVac = [...state.vaccinated];
+  const nextDef = [...defState];
+  const nextParent = [...parent];
+
+  // Reactive vaccination — if any node is compromised, all unprotected
+  // subscribers transition S → V instantly. Idempotent (safe to apply every tick).
+  if (infState.some((x) => x)) {
+    for (let i = 0; i < N; i++) {
+      if (subscribed[i] && !infState[i] && !defState[i] && !nextVac[i]) nextVac[i] = true;
+    }
+  }
+
+  // Transmission: inference-capable compromised nodes attempt clean neighbors.
+  // V and D block infection; any probed target may commandeer the attacker.
+  for (let i = 0; i < N; i++) {
+    if (!infState[i] || !capability[i]) continue;
+    for (const j of adjacency[i]) {
+      if (infState[j] || defState[j]) continue;
+      if (commandeer > 0 && reversalRng() < commandeer) {
+        nextInf[i] = false;
+        nextDef[i] = true;
+        break;
+      }
+      if (!nextVac[j] && rng() < transmission) {
+        // First successful attacker this tick is recorded as the compromiser.
+        if (!nextInf[j]) nextParent[j] = i;
+        nextInf[j] = true;
+      }
+    }
+  }
+
+  // Reversal propagation: defender agents convert swarm agents and reclaim hosts.
+  if (swarmConversion > 0 || hostReclamation > 0) {
+    for (let i = 0; i < N; i++) {
+      if (!defState[i] || !capability[i]) continue;
+      for (const j of adjacency[i]) {
+        if (!infState[j] || nextDef[j]) continue;
+        // Under a global C2, swarm agents are handled in aggregate below.
+        if (capability[j] && lineageReach === 'full') continue;
+        const q = capability[j] ? swarmConversion : hostReclamation;
+        if (q > 0 && reversalRng() < q) {
+          nextInf[j] = false;
+          nextDef[j] = true;
+        }
+      }
+      if (lineageReach === 'direct' && swarmConversion > 0) {
+        for (let a = parent[i]; a !== -1; a = parent[a]) {
+          if (!infState[a] || nextDef[a] || adjacency[i].includes(a)) continue;
+          if (reversalRng() < swarmConversion) {
+            nextInf[a] = false;
+            nextDef[a] = true;
+          }
+        }
+      }
+    }
+
+    if (lineageReach === 'full' && swarmConversion > 0) {
+      let k = 0;
+      for (let i = 0; i < N; i++) if (defState[i] && capability[i]) k++;
+      if (k > 0) {
+        const q = 1 - (1 - swarmConversion) ** k;
+        for (let j = 0; j < N; j++) {
+          if (!infState[j] || !capability[j] || nextDef[j]) continue;
+          if (reversalRng() < q) {
+            nextInf[j] = false;
+            nextDef[j] = true;
+          }
+        }
+      }
+    }
+  }
+
+  return { infected: nextInf, vaccinated: nextVac, defender: nextDef, parent: nextParent };
+}
+
+// Filename tag for reversal parameters; empty when reversal is off so figures
+// exported from the plain SI+V model keep their original names.
+function reversalTag({ commandeer, swarmConversion, hostReclamation, lineageReach }) {
+  if (!commandeer && !swarmConversion && !hostReclamation) return '';
+  const f = (x) => x.toFixed(2).replace('.', '');
+  const anc = { direct: '_anc', full: '_c2' }[lineageReach] ?? '';
+  return `_rev_k${f(commandeer)}_s${f(swarmConversion)}_h${f(hostReclamation)}${anc}`;
 }
 
 function Slider({ label, value, min, max, step, onChange, format }) {
@@ -469,12 +606,20 @@ export default function RACSimulator() {
   const [transmission, setTransmission] = useState(0.15);
   const [vaccinationRate, setVaccinationRate] = useState(0); // v ∈ [0,1] — crowd defense adoption
 
+  // Reversal dynamics (all 0 = plain SI+V model).
+  const [commandeer, setCommandeer] = useState(0);             // κ — target seizes its attacker
+  const [swarmConversion, setSwarmConversion] = useState(0);   // σ — defender converts swarm agent
+  const [hostReclamation, setHostReclamation] = useState(0);   // η — defender reclaims compromised host
+  const [lineageReach, setLineageReach] = useState('direct');  // σ reach: 'off' | 'direct' | 'full'
+
   // Playback
   const [simSeed, setSimSeed] = useState(1);
   const [targetTick, setTargetTick] = useState(15);
   const [tick, setTick] = useState(0);
   const [infected, setInfected] = useState([]);
   const [vaccinated, setVaccinated] = useState([]);
+  const [defender, setDefender] = useState([]);
+  const [parent, setParent] = useState([]);
   const [playing, setPlaying] = useState(false);
 
   // Sweep
@@ -591,61 +736,47 @@ export default function RACSimulator() {
     [N, adjacency, capThresholdsOrdered, subThresholdsOrdered]
   );
 
+  const applyState = (st) => {
+    setInfected(st.infected);
+    setVaccinated(st.vaccinated);
+    setDefender(st.defender);
+    setParent(st.parent);
+  };
+
   // Reset whenever any initial-condition parameter changes.
   useEffect(() => {
     setPlaying(false);
-    const init = buildInitialState(capability, subscribed, infPrio, initialInfected);
-    setInfected(init.infected);
-    setVaccinated(init.vaccinated);
+    applyState(buildInitialState(capability, subscribed, infPrio, initialInfected));
     setTick(0);
   }, [capability, subscribed, infPrio, initialInfected, simSeed]);
 
-  // SI+V step — instantaneous reactive vaccination + SI transmission.
-  // Deterministic given (simSeed, tick).
+  const reversal = useMemo(
+    () => ({ commandeer, swarmConversion, hostReclamation, lineageReach }),
+    [commandeer, swarmConversion, hostReclamation, lineageReach]
+  );
+
+  // Shared dynamics parameters for every simulation path.
+  const dynamicsParams = useMemo(
+    () => ({ N, adjacency, capability, subscribed, transmission, ...reversal }),
+    [N, adjacency, capability, subscribed, transmission, reversal]
+  );
+
+  // SI+V+D step. Deterministic given (simSeed, tick).
   const stepOnce = useCallback(
-    (infState, vacState, currentTick) => {
-      const rng = mulberry32(simSeed * 1000 + currentTick + 1);
-      const nextInf = [...infState];
-      const nextVac = [...vacState];
-
-      // Reactive vaccination — if any node is compromised, all unprotected
-      // subscribers transition S → V instantly. Idempotent (safe to apply every tick).
-      const anyInf = infState.some((x) => x);
-      if (anyInf) {
-        for (let i = 0; i < N; i++) {
-          if (subscribed[i] && !infState[i] && !nextVac[i]) nextVac[i] = true;
-        }
-      }
-
-      // Transmission: inference-capable compromised nodes attempt uninfected,
-      // unvaccinated neighbors. V blocks infection.
-      for (let i = 0; i < N; i++) {
-        if (!infState[i] || !capability[i]) continue;
-        for (const j of adjacency[i]) {
-          if (!infState[j] && !nextVac[j]) {
-            if (rng() < transmission) nextInf[j] = true;
-          }
-        }
-      }
-      return { infected: nextInf, vaccinated: nextVac };
-    },
-    [N, adjacency, capability, subscribed, transmission, simSeed]
+    (state, currentTick) => stepDynamics(state, dynamicsParams, simSeed * 1000 + currentTick + 1),
+    [dynamicsParams, simSeed]
   );
 
   const step = useCallback(() => {
-    const next = stepOnce(infected, vaccinated, tick);
-    setInfected(next.infected);
-    setVaccinated(next.vaccinated);
+    applyState(stepOnce({ infected, vaccinated, defender, parent }, tick));
     setTick((t) => t + 1);
-  }, [stepOnce, infected, vaccinated, tick]);
+  }, [stepOnce, infected, vaccinated, defender, parent, tick]);
 
   // Playback loop.
   useEffect(() => {
     if (!playing) return;
     const id = setInterval(() => {
-      const next = stepOnce(infectedRef.current, vaccinatedRef.current, tickRef.current);
-      setInfected(next.infected);
-      setVaccinated(next.vaccinated);
+      applyState(stepOnce(stateRef.current, tickRef.current));
       setTick((t) => t + 1);
     }, 350);
     return () => clearInterval(id);
@@ -653,46 +784,24 @@ export default function RACSimulator() {
 
   // Refs so the playback interval always reads latest state.
   const tickRef = useRef(tick);
-  const infectedRef = useRef(infected);
-  const vaccinatedRef = useRef(vaccinated);
+  const stateRef = useRef({ infected, vaccinated, defender, parent });
   useEffect(() => { tickRef.current = tick; }, [tick]);
-  useEffect(() => { infectedRef.current = infected; }, [infected]);
-  useEffect(() => { vaccinatedRef.current = vaccinated; }, [vaccinated]);
+  useEffect(() => {
+    stateRef.current = { infected, vaccinated, defender, parent };
+  }, [infected, vaccinated, defender, parent]);
 
   // Synchronous run-to-tick — for generating the exact figure.
   const runToTarget = useCallback(() => {
     setPlaying(false);
     let s = buildInitialState(capability, subscribed, infPrio, initialInfected);
-    for (let t = 0; t < targetTick; t++) {
-      const rng = mulberry32(simSeed * 1000 + t + 1);
-      const nextInf = [...s.infected];
-      const nextVac = [...s.vaccinated];
-      const anyInf = s.infected.some((x) => x);
-      if (anyInf) {
-        for (let i = 0; i < N; i++) {
-          if (subscribed[i] && !s.infected[i] && !nextVac[i]) nextVac[i] = true;
-        }
-      }
-      for (let i = 0; i < N; i++) {
-        if (!s.infected[i] || !capability[i]) continue;
-        for (const j of adjacency[i]) {
-          if (!s.infected[j] && !nextVac[j]) {
-            if (rng() < transmission) nextInf[j] = true;
-          }
-        }
-      }
-      s = { infected: nextInf, vaccinated: nextVac };
-    }
-    setInfected(s.infected);
-    setVaccinated(s.vaccinated);
+    for (let t = 0; t < targetTick; t++) s = stepOnce(s, t);
+    applyState(s);
     setTick(targetTick);
-  }, [capability, subscribed, infPrio, initialInfected, targetTick, simSeed, N, adjacency, transmission]);
+  }, [capability, subscribed, infPrio, initialInfected, targetTick, stepOnce]);
 
   const reset = useCallback(() => {
     setPlaying(false);
-    const init = buildInitialState(capability, subscribed, infPrio, initialInfected);
-    setInfected(init.infected);
-    setVaccinated(init.vaccinated);
+    applyState(buildInitialState(capability, subscribed, infPrio, initialInfected));
     setTick(0);
   }, [capability, subscribed, infPrio, initialInfected]);
 
@@ -767,34 +876,25 @@ export default function RACSimulator() {
 
         // Instantaneous reactive vaccination — if any seed is infected, all
         // uninfected subscribers become V at t=0 before transmission begins.
-        let vacState = new Array(N).fill(false);
+        const vacState = new Array(N).fill(false);
         if (infState.some((x) => x)) {
           for (let i = 0; i < N; i++) {
             if (sub[i] && !infState[i]) vacState[i] = true;
           }
         }
 
-        for (let t = 0; t < targetTick; t++) {
-          const rng = mulberry32(trial * 1000 + t + 1);
-          const nextInf = [...infState];
-          // (Once V, always V in this model — so vacState is invariant after t=0.)
-          for (let i = 0; i < N; i++) {
-            if (!infState[i] || !cap[i]) continue;
-            for (const j of adjacency[i]) {
-              if (!infState[j] && !vacState[j]) {
-                if (rng() < transmission) nextInf[j] = true;
-              }
-            }
-          }
-          infState = nextInf;
-        }
+        const params = { N, adjacency, capability: cap, subscribed: sub, transmission, ...reversal };
+        let st = { infected: infState, vaccinated: vacState, defender: new Array(N).fill(false) };
+        for (let t = 0; t < targetTick; t++) st = stepDynamics(st, params, trial * 1000 + t + 1);
 
-        let capInf = 0, nonCapInf = 0, vacCount = 0;
+        let capInf = 0, nonCapInf = 0, vacCount = 0, defCount = 0;
         for (let i = 0; i < N; i++) {
-          if (infState[i]) {
+          if (st.infected[i]) {
             if (cap[i]) capInf++;
             else nonCapInf++;
-          } else if (vacState[i]) {
+          } else if (st.defender[i]) {
+            defCount++;
+          } else if (st.vaccinated[i]) {
             vacCount++;
           }
         }
@@ -803,6 +903,7 @@ export default function RACSimulator() {
           prop: capInf / N,
           term: nonCapInf / N,
           vac: vacCount / N,
+          def: defCount / N,
         });
       }
 
@@ -813,6 +914,7 @@ export default function RACSimulator() {
       const propM = avg('prop');
       const termM = avg('term');
       const vacM = avg('vac');
+      const defM = avg('def');
 
       results.push({
         x,
@@ -824,6 +926,8 @@ export default function RACSimulator() {
         termStd: std('term', termM),
         vac: vacM,
         vacStd: std('vac', vacM),
+        def: defM,
+        defStd: std('def', defM),
       });
 
       setSweepProgress((k + 1) / sweepPoints);
@@ -850,6 +954,7 @@ export default function RACSimulator() {
       sweepSeedStrategy,
       density,         // scenario ρ (fixed during v-sweep; ignored during ρ-sweep)
       vaccinationRate, // scenario v (fixed during ρ-sweep; ignored during v-sweep)
+      ...reversal,
       // Snapshot the numerical threshold at sweep time so the marker matches the captured run.
       numericalThreshold: axis === 'rho' ? rhoThreshold : vThreshold,
     });
@@ -882,6 +987,7 @@ export default function RACSimulator() {
     vaccinationRate,
     rhoThreshold,
     vThreshold,
+    reversal,
   ]);
 
   const exportSweepPNG = useCallback(() => {
@@ -906,7 +1012,7 @@ export default function RACSimulator() {
       : '';
     const filename = `rac_${axisTag}_${kindTag}${alphaTag}_${modeTag}_${stratTag}_N${c.N}_k${c.meanDegree}_seed${c.topologySeed}_p${c.transmission
       .toFixed(2)
-      .replace('.', '')}_${fixedTag}_t${c.targetTick}_trials${c.sweepTrials}${overrideTag}.png`;
+      .replace('.', '')}_${fixedTag}_t${c.targetTick}_trials${c.sweepTrials}${reversalTag(c)}${overrideTag}.png`;
     rasterizeSVGToPNG(sweepSvgRef.current, sweepWidth, sweepHeight, filename, '#fafaf9');
   }, [sweepResults, sweepCapture, sweepThresholdOverride, sweepThresholdHidden, sweepWidth, sweepHeight]);
 
@@ -943,7 +1049,7 @@ export default function RACSimulator() {
             const j = Math.floor(placeRng() * (i + 1));
             [capableIndices[i], capableIndices[j]] = [capableIndices[j], capableIndices[i]];
           }
-          let infState = new Array(N).fill(false);
+          const infState = new Array(N).fill(false);
           const nSeeds = Math.min(initialInfected, capableIndices.length);
           for (let k2 = 0; k2 < nSeeds; k2++) infState[capableIndices[k2]] = true;
 
@@ -955,22 +1061,12 @@ export default function RACSimulator() {
             }
           }
 
-          for (let t = 0; t < targetTick; t++) {
-            const rng = mulberry32(trial * 1000 + t + 1);
-            const nextInf = [...infState];
-            for (let i = 0; i < N; i++) {
-              if (!infState[i] || !cap[i]) continue;
-              for (const j of adjacency[i]) {
-                if (!infState[j] && !vacState[j]) {
-                  if (rng() < transmission) nextInf[j] = true;
-                }
-              }
-            }
-            infState = nextInf;
-          }
+          const params = { N, adjacency, capability: cap, subscribed: sub, transmission, ...reversal };
+          let st = { infected: infState, vaccinated: vacState, defender: new Array(N).fill(false) };
+          for (let t = 0; t < targetTick; t++) st = stepDynamics(st, params, trial * 1000 + t + 1);
 
           let totalInf = 0;
-          for (let i = 0; i < N; i++) if (infState[i]) totalInf++;
+          for (let i = 0; i < N; i++) if (st.infected[i]) totalInf++;
           trialTotals.push(totalInf / N);
         }
 
@@ -1004,6 +1100,7 @@ export default function RACSimulator() {
       surfaceTrials,
       gridSize: G,
       contourPoints: percolationContour,
+      ...reversal,
     });
     setSurfaceProgress(1);
     setSurfaceRunning(false);
@@ -1025,6 +1122,7 @@ export default function RACSimulator() {
     capabilityMode,
     subscriptionMode,
     percolationContour,
+    reversal,
   ]);
 
   const exportSurfacePNG = useCallback(() => {
@@ -1035,7 +1133,7 @@ export default function RACSimulator() {
     const modeTag = `cap${(c.capabilityMode || 'uniform')[0]}_sub${(c.subscriptionMode || 'uniform')[0]}`;
     const filename = `rac_surface_${kindTag}${alphaTag}_${modeTag}_N${c.N}_k${c.meanDegree}_seed${c.topologySeed}_p${c.transmission
       .toFixed(2)
-      .replace('.', '')}_t${c.targetTick}_g${c.gridSize}_trials${c.surfaceTrials}.png`;
+      .replace('.', '')}_t${c.targetTick}_g${c.gridSize}_trials${c.surfaceTrials}${reversalTag(c)}.png`;
     rasterizeSVGToPNG(surfaceSvgRef.current, surfaceWidth, surfaceHeight, filename, '#fafaf9');
   }, [surfaceResults, surfaceCapture, surfaceWidth, surfaceHeight]);
 
@@ -1049,10 +1147,15 @@ export default function RACSimulator() {
       c.topologyKind !== topologyKind ||
       c.baAlpha !== baAlpha ||
       c.capabilityMode !== capabilityMode ||
+      c.commandeer !== commandeer ||
+      c.swarmConversion !== swarmConversion ||
+      c.hostReclamation !== hostReclamation ||
+      c.lineageReach !== lineageReach ||
       c.subscriptionMode !== subscriptionMode
     );
   }, [
     surfaceCapture,
+    reversal,
     transmission,
     targetTick,
     initialInfected,
@@ -1076,6 +1179,10 @@ export default function RACSimulator() {
       c.topologyKind !== topologyKind ||
       c.baAlpha !== baAlpha ||
       c.capabilityMode !== capabilityMode ||
+      c.commandeer !== commandeer ||
+      c.swarmConversion !== swarmConversion ||
+      c.hostReclamation !== hostReclamation ||
+      c.lineageReach !== lineageReach ||
       c.subscriptionMode !== subscriptionMode
     ) {
       return true;
@@ -1086,6 +1193,7 @@ export default function RACSimulator() {
     return false;
   }, [
     sweepCapture,
+    reversal,
     transmission,
     targetTick,
     initialInfected,
@@ -1106,16 +1214,21 @@ export default function RACSimulator() {
       nonCapVac = 0,
       capSus = 0,
       capInf = 0,
-      capVac = 0;
+      capVac = 0,
+      capDef = 0,
+      nonCapDef = 0;
     for (let i = 0; i < N; i++) {
       const inf = infected[i];
-      const vac = !inf && vaccinated[i];
+      const def = !inf && defender[i];
+      const vac = !inf && !def && vaccinated[i];
       if (capability[i]) {
         if (inf) capInf++;
+        else if (def) capDef++;
         else if (vac) capVac++;
         else capSus++;
       } else {
         if (inf) nonCapInf++;
+        else if (def) nonCapDef++;
         else if (vac) nonCapVac++;
         else nonCapSus++;
       }
@@ -1124,8 +1237,13 @@ export default function RACSimulator() {
     const totalVac = capVac + nonCapVac;
     const pct = N > 0 ? (totalInf / N) * 100 : 0;
     const vacPct = N > 0 ? (totalVac / N) * 100 : 0;
-    return { nonCapSus, nonCapInf, nonCapVac, capSus, capInf, capVac, totalInf, totalVac, pct, vacPct };
-  }, [N, capability, infected, vaccinated]);
+    const totalDef = capDef + nonCapDef;
+    return {
+      nonCapSus, nonCapInf, nonCapVac, nonCapDef,
+      capSus, capInf, capVac, capDef,
+      totalInf, totalVac, totalDef, pct, vacPct,
+    };
+  }, [N, capability, infected, vaccinated, defender]);
 
   // Export a 3x-scaled PNG for paper figures; parameters encoded in filename.
   const exportPNG = useCallback(() => {
@@ -1135,7 +1253,7 @@ export default function RACSimulator() {
       .toFixed(2)
       .replace('.', '')}_p${transmission.toFixed(2).replace('.', '')}_v${vaccinationRate
       .toFixed(2)
-      .replace('.', '')}_t${tick}.png`;
+      .replace('.', '')}_t${tick}${reversalTag(reversal)}.png`;
     rasterizeSVGToPNG(svgRef.current, width, height, filename, '#fafaf9');
   }, [
     N,
@@ -1148,10 +1266,12 @@ export default function RACSimulator() {
     transmission,
     vaccinationRate,
     tick,
+    reversal,
   ]);
 
   const nodeFill = (i) => {
     if (infected[i]) return '#dc2626';   // compromised — red regardless of capability
+    if (defender[i]) return capability[i] ? '#2563eb' : '#93c5fd'; // defender agent / reclaimed host
     if (vaccinated[i]) return '#16a34a'; // vaccinated — green regardless of capability
     if (capability[i]) return '#f97316'; // inference-capable susceptible — orange
     return '#ffffff';                    // non-inference susceptible — white
@@ -1176,6 +1296,7 @@ export default function RACSimulator() {
           <div className="text-xs text-stone-500 text-right font-mono">
             <div>SI dynamics on capability-gated ER graph</div>
             <div>G(N, k) · seed fixed · ρ, p adjustable</div>
+            <div>Reversal κ, σ, η adjustable</div>
           </div>
         </div>
 
@@ -1387,6 +1508,90 @@ export default function RACSimulator() {
               />
             </div>
 
+            <div className="border border-stone-300 bg-white p-5 space-y-5">
+              <h2 className="text-xs uppercase tracking-wider font-semibold border-b border-stone-900 pb-2">
+                Reversal
+              </h2>
+              <div className="space-y-1.5">
+                <Slider
+                  label="Commandeer  κ"
+                  value={commandeer}
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  onChange={setCommandeer}
+                  format={(v) => v.toFixed(2)}
+                />
+                <div className="text-[10px] text-stone-500 leading-snug">
+                  Per attack attempt: probability the target seizes the attacking agent and
+                  repurposes it as a defender.
+                </div>
+              </div>
+              <div className="space-y-1.5">
+                <Slider
+                  label="Swarm conversion  σ"
+                  value={swarmConversion}
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  onChange={setSwarmConversion}
+                  format={(v) => v.toFixed(2)}
+                />
+                <div className="text-[10px] text-stone-500 leading-snug">
+                  Per tick, per contact: probability a defender agent converts a neighboring
+                  swarm agent into another defender.
+                </div>
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-xs uppercase tracking-wider text-stone-500 font-medium">
+                  Lineage reach
+                </label>
+                <div className="grid grid-cols-3 border border-stone-900">
+                  {[
+                    { key: 'off', label: 'Off' },
+                    { key: 'direct', label: 'Direct' },
+                    { key: 'full', label: 'Full (C2)' },
+                  ].map((m, i) => (
+                    <button
+                      key={m.key}
+                      onClick={() => setLineageReach(m.key)}
+                      className={`px-2 py-1.5 text-[11px] uppercase tracking-wider transition-colors ${
+                        i > 0 ? 'border-l border-stone-900' : ''
+                      } ${
+                        lineageReach === m.key
+                          ? 'bg-stone-900 text-white'
+                          : 'bg-white hover:bg-stone-100'
+                      }`}
+                    >
+                      {m.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="text-[10px] text-stone-500 leading-snug">
+                  {lineageReach === 'off'
+                    ? 'Defenders reach only their direct network neighbors.'
+                    : lineageReach === 'direct'
+                    ? 'A defender also targets its chain of compromising agents (parent, grandparent, … back to the seed) with σ, even without a direct edge.'
+                    : 'Global C2: the swarm is unified, so every defender agent reaches every compromised agent with σ each tick, across the entire infection tree.'}
+                </div>
+              </div>
+              <div className="space-y-1.5">
+                <Slider
+                  label="Host reclamation  η"
+                  value={hostReclamation}
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  onChange={setHostReclamation}
+                  format={(v) => v.toFixed(2)}
+                />
+                <div className="text-[10px] text-stone-500 leading-snug">
+                  Per tick, per contact: probability a defender agent reclaims a neighboring
+                  host the swarm has already compromised.
+                </div>
+              </div>
+            </div>
+
             <div className="border border-stone-300 bg-white p-5 space-y-4">
               <h2 className="text-xs uppercase tracking-wider font-semibold border-b border-stone-900 pb-2">
                 Playback
@@ -1458,6 +1663,14 @@ export default function RACSimulator() {
                 </div>
                 <div className="px-4 py-2.5 border-r border-stone-300 flex items-baseline gap-2">
                   <span className="text-[10px] uppercase tracking-wider text-stone-500">
+                    Defenders
+                  </span>
+                  <span className="font-mono text-base tabular-nums">
+                    {stats.totalDef}/{N}
+                  </span>
+                </div>
+                <div className="px-4 py-2.5 border-r border-stone-300 flex items-baseline gap-2">
+                  <span className="text-[10px] uppercase tracking-wider text-stone-500">
                     Rate
                   </span>
                   <span className="font-mono text-base tabular-nums">{stats.pct.toFixed(1)}%</span>
@@ -1467,6 +1680,8 @@ export default function RACSimulator() {
                   <LegendSwatch fill="#f97316" label="Inf. S" />
                   <LegendSwatch fill="#16a34a" label="V" />
                   <LegendSwatch fill="#dc2626" label="I" />
+                  <LegendSwatch fill="#2563eb" label="D agent" />
+                  <LegendSwatch fill="#93c5fd" label="D host" />
                 </div>
               </div>
 
@@ -1487,6 +1702,10 @@ export default function RACSimulator() {
                     const active =
                       (infected[sIdx] && capability[sIdx] && !infected[tIdx]) ||
                       (infected[tIdx] && capability[tIdx] && !infected[sIdx]);
+                    // Reversal front: a defender agent faces a compromised neighbor.
+                    const reversing =
+                      (defender[sIdx] && capability[sIdx] && infected[tIdx]) ||
+                      (defender[tIdx] && capability[tIdx] && infected[sIdx]);
                     return (
                       <line
                         key={e.id}
@@ -1494,8 +1713,8 @@ export default function RACSimulator() {
                         y1={a.y}
                         x2={b.x}
                         y2={b.y}
-                        stroke={active ? '#9ca3af' : '#d6d3d1'}
-                        strokeWidth={active ? 1.1 : 0.8}
+                        stroke={reversing ? '#60a5fa' : active ? '#9ca3af' : '#d6d3d1'}
+                        strokeWidth={reversing || active ? 1.1 : 0.8}
                       />
                     );
                   })}
@@ -1534,6 +1753,11 @@ export default function RACSimulator() {
                 top
                 border="none"
               />
+              <Cell label="κ (commandeer)" value={commandeer.toFixed(2)} top />
+              <Cell label="σ (swarm conv.)" value={swarmConversion.toFixed(2)} top />
+              <Cell label="η (host reclaim)" value={hostReclamation.toFixed(2)} top />
+              <Cell label="Defender agents (D, inf.)" value={stats.capDef} top />
+              <Cell label="Reclaimed hosts (D, non-inf.)" value={stats.nonCapDef} top border="none" />
             </div>
 
             <div className="text-[11px] text-stone-500 leading-relaxed">
@@ -1550,6 +1774,22 @@ export default function RACSimulator() {
               channel is triggered endogenously by detection events, not by an exogenous campaign
               rate. Empirically, v shifts the effective reproduction number R<sub>eff</sub> ≈ ρ·p·⟨k⟩·(1−v)
               — at sufficient adoption, R<sub>eff</sub> drops below 1 even at supercritical ρ.
+            </div>
+            <div className="text-[11px] text-stone-500 leading-relaxed">
+              Reversal dynamics (D). Every attack attempt a propagator makes on a clean neighbor
+              carries a probability κ that the target commandeers the attacker instead, flipping it
+              I → D. A defender agent turns the swarm's own reach against it: each tick it attempts
+              every compromised neighbor, converting swarm agents (compromised inference-capable
+              nodes) into further defender agents with probability σ and reclaiming compromised
+              hosts (non-inference nodes the swarm already holds) with probability η. Converted
+              agents propagate the reversal onward; reclaimed hosts cannot. Lineage reach widens σ
+              beyond direct links: in Direct mode a defender also knows the lineage of agents that
+              compromised it and applies σ to each ancestor back to the seed; in Full (C2) mode the
+              swarm shares a global command-and-control channel, so every defender agent applies σ
+              to every compromised agent in the swarm each tick. Host reclamation always needs a
+              direct link. D is absorbing and
+              blocks reinfection, so the attack and the reversal front compete on the same
+              substrate. With κ = σ = η = 0 the model reduces exactly to SI + reactive-V.
             </div>
           </div>
         </div>
@@ -1581,6 +1821,16 @@ export default function RACSimulator() {
                   ? `v = ${(sweepCapture?.vaccinationRate ?? vaccinationRate).toFixed(2)}`
                   : `ρ = ${(sweepCapture?.density ?? density).toFixed(2)}`}
               </div>
+              {reversalTag(sweepCapture ?? reversal) && (
+                <div>
+                  κ = {(sweepCapture?.commandeer ?? commandeer).toFixed(2)} · σ ={' '}
+                  {(sweepCapture?.swarmConversion ?? swarmConversion).toFixed(2)} · η ={' '}
+                  {(sweepCapture?.hostReclamation ?? hostReclamation).toFixed(2)}
+                  {{ direct: ' · ancestral', full: ' · global C2' }[
+                    sweepCapture?.lineageReach ?? lineageReach
+                  ] ?? ''}
+                </div>
+              )}
             </div>
           </div>
 
@@ -1828,6 +2078,9 @@ export default function RACSimulator() {
                   </div>
                   <div className="flex-1 px-4 py-2.5 flex items-center justify-end gap-4 text-[11px] text-stone-600">
                     <LegendLine color="#292524" label="Compromise rate (mean ± σ)" />
+                    {sweepResults?.some((d) => d.def > 0) && (
+                      <LegendLine color="#2563eb" label="Defender fraction" dashed />
+                    )}
                   </div>
                 </div>
 
@@ -2414,6 +2667,20 @@ function SweepPlot({
               )}
               <tspan dx={4}>= {displayThreshold.toFixed(3)}</tspan>
             </text>
+          </g>
+        )}
+
+        {/* Defender fraction — only when reversal produced any defenders */}
+        {results.some((d) => d.def > 0) && (
+          <g pointerEvents="none">
+            <path d={makeBand('def', 'defStd')} fill="#2563eb" opacity={0.1} />
+            <path
+              d={makePath('def')}
+              stroke="#2563eb"
+              strokeWidth={1.6}
+              strokeDasharray="5 3"
+              fill="none"
+            />
           </g>
         )}
 
